@@ -184,23 +184,38 @@ app.post("/contests/:id/register", verifyJWT, async (req, res) => {
     const { id } = req.params;
     const userEmail = req.user.email;
 
-    if (!ObjectId.isValid(id)) return res.status(400).send({ message: "Invalid contest ID" });
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "Invalid contest ID" });
+    }
 
     const contest = await contestsCollection.findOne({ _id: new ObjectId(id) });
-    if (!contest) return res.status(404).send({ message: "Contest not found" });
+    if (!contest) {
+      return res.status(404).send({ message: "Contest not found" });
+    }
 
-    if (contest.participants?.includes(userEmail)) return res.status(400).send({ message: "Already registered" });
+    //  Ensure participants is an array
+    const participants = Array.isArray(contest.participants)
+      ? contest.participants
+      : [];
 
+    if (participants.includes(userEmail)) {
+      return res.status(400).send({ message: "Already registered" });
+    }
+
+    // Update participants as array
     await contestsCollection.updateOne(
       { _id: contest._id },
-      { $push: { participants: userEmail } }
+      { $set: { participants: [...participants, userEmail] } }
     );
 
     res.send({ message: "Registered successfully" });
   } catch (err) {
-    res.status(500).send({ message: err.message });
+    console.error("REGISTER ERROR:", err);
+    res.status(500).send({ message: "Internal Server Error" });
   }
 });
+
+
 
 // SUBMIT TASK 
 app.post("/contests/:id/submit-task", verifyJWT, async (req, res) => {
@@ -231,4 +246,4 @@ app.post("/contests/:id/submit-task", verifyJWT, async (req, res) => {
 /* ================= SERVER ================= */
 app.get("/", (req, res) => res.send("🚀 ContestHub API Running"));
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`✅ Server running on http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
