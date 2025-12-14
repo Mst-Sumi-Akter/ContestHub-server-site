@@ -144,7 +144,7 @@ app.get("/contests", async (req, res) => {
   }
 });
 
-// GET contest by id (ObjectId only)
+// GET contest by id 
 app.get("/contests/:id", verifyJWT, async (req, res) => {
   try {
     const { id } = req.params;
