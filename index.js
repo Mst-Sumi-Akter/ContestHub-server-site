@@ -476,6 +476,41 @@ app.get("/contests/:id/submissions", verifyJWT, verifyCreator, async (req, res) 
   }
 });
 
+// ================= LEADERBOARD =================
+app.get("/leaderboard", async (req, res) => {
+  try {
+    const users = await usersCollection.find({}).toArray();
+    const contests = await contestsCollection.find({}).toArray();
+
+    // Calculate wins per user
+    const leaderboard = users.map((user) => {
+      let points = 0;
+
+      contests.forEach((contest) => {
+        if (contest.submissions?.some((s) => s.userEmail === user.email && s.status === "winner")) {
+          points += 1; // 1 point per contest win
+        }
+      });
+
+      return {
+        id: user._id,
+        name: user.name,
+        role: user.role,
+        points,
+      };
+    });
+
+    // Sort descending by points
+    leaderboard.sort((a, b) => b.points - a.points);
+
+    res.send(leaderboard);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ message: "Internal server error" });
+  }
+});
+
+
 
 
 
