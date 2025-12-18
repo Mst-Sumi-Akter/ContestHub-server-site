@@ -210,43 +210,8 @@ app.put("/users/:id/role", verifyJWT, verifyAdmin, async (req, res) => {
   }
 });
 
-// UPDATE current user
-// app.put("/auth/me", verifyJWT, async (req, res) => {
-//   console.log("PUT /auth/me called by:", req.user?.email);
-//   try {
-//     const { name, photoURL, bio } = req.body;
 
-//     const updateFields = {};
-//     if (name !== undefined) updateFields.name = name;
-//     if (photoURL !== undefined) updateFields.photoURL = photoURL;
-//     if (bio !== undefined) updateFields.bio = bio;
-//     const userEmail = req.user.email?.toLowerCase();
-//     console.log("Looking for user:", userEmail);
-//     console.log("DB user exists?", await usersCollection.findOne({ email: userEmail }));
-//      console.log("Updating user with email:", userEmail);
-// console.log("DB user exists?", userInDb);
 
-//     const result = await usersCollection.findOneAndUpdate(
-//       { email: req.user.email.toLowerCase() },
-//       { $set: updateFields },
-//       { returnDocument: "after" }
-//     );
-//     console.log("Update result:", result);
-
-//     if (!result.value)
-//       return res.status(404).send({ message: "User not found" });
-
-//     res.send({
-//       email: result.value.email,
-//       name: result.value.name,
-//       role: result.value.role, 
-//       photoURL: result.value.photoURL || null,
-//       bio: result.value.bio || "",
-//     });
-//   } catch (err) {
-//     res.status(500).send({ message: err.message });
-//   }
-// });
 // UPDATE current user
 app.put("/auth/me", verifyJWT, async (req, res) => {
   try {
