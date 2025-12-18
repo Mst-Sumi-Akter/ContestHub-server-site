@@ -4,6 +4,11 @@ const cors = require("cors");
 const { MongoClient, ObjectId } = require("mongodb");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
+// STRIPE KEY - Use environment variable
+if (!process.env.STRIPE_SECRET_KEY) {
+  console.warn("⚠️  STRIPE_SECRET_KEY missing in .env. Payment features will be disabled.");
+}
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY || "dummy_key");
 
 const app = express();
 
@@ -32,7 +37,7 @@ connectDB();
 
 /* ================= JWT ================= */
 const createToken = (user) =>
-  jwt.sign({ email: user.email, role: user.role }, process.env.JWT_SECRET, {
+  jwt.sign({ email: user.email.toLowerCase(), role: user.role }, process.env.JWT_SECRET, {
     expiresIn: "7d",
   });
 
@@ -170,35 +175,114 @@ app.get("/auth/me", verifyJWT, async (req, res) => {
   }
 });
 
-// UPDATE current user
-app.put("/auth/me", verifyJWT, async (req, res) => {
+// GET all users (Admin only)
+app.get("/users", verifyJWT, verifyAdmin, async (req, res) => {
   try {
-    const { name, photoURL, bio } = req.body;
-    const updateFields = {};
-    if (name) updateFields.name = name;
-    if (photoURL) updateFields.photoURL = photoURL;
-    if (bio) updateFields.bio = bio;
-
-    const emailLower = req.user.email.toLowerCase();
-    const result = await usersCollection.findOneAndUpdate(
-      { email: emailLower },
-      { $set: updateFields },
-      { returnDocument: "after" }
-    );
-
-    if (!result.value)
-      return res.status(404).send({ message: "User not found" });
-
-    res.send({
-      email: result.value.email,
-      name: result.value.name,
-      photoURL: result.value.photoURL || null,
-      bio: result.value.bio || "",
-    });
+    const users = await usersCollection.find({}).toArray();
+    res.send(users);
   } catch (err) {
     res.status(500).send({ message: err.message });
   }
 });
+
+// UPDATE user role (Admin only)
+app.put("/users/:id/role", verifyJWT, verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { role } = req.body;
+
+    if (!ObjectId.isValid(id))
+      return res.status(400).send({ message: "Invalid user ID" });
+
+    // Prevent changing own role (optional safety)
+    if (req.user.email === (await usersCollection.findOne({ _id: new ObjectId(id) }))?.email && role !== "admin") {
+      // allow self-demotion? usually dangerous. Let's warn or allow.
+      // Implementation choice: Allow.
+    }
+
+    await usersCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { role } }
+    );
+    res.send({ message: "Role updated successfully" });
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+});
+
+// UPDATE current user
+// app.put("/auth/me", verifyJWT, async (req, res) => {
+//   console.log("PUT /auth/me called by:", req.user?.email);
+//   try {
+//     const { name, photoURL, bio } = req.body;
+
+//     const updateFields = {};
+//     if (name !== undefined) updateFields.name = name;
+//     if (photoURL !== undefined) updateFields.photoURL = photoURL;
+//     if (bio !== undefined) updateFields.bio = bio;
+//     const userEmail = req.user.email?.toLowerCase();
+//     console.log("Looking for user:", userEmail);
+//     console.log("DB user exists?", await usersCollection.findOne({ email: userEmail }));
+//      console.log("Updating user with email:", userEmail);
+// console.log("DB user exists?", userInDb);
+
+//     const result = await usersCollection.findOneAndUpdate(
+//       { email: req.user.email.toLowerCase() },
+//       { $set: updateFields },
+//       { returnDocument: "after" }
+//     );
+//     console.log("Update result:", result);
+
+//     if (!result.value)
+//       return res.status(404).send({ message: "User not found" });
+
+//     res.send({
+//       email: result.value.email,
+//       name: result.value.name,
+//       role: result.value.role, 
+//       photoURL: result.value.photoURL || null,
+//       bio: result.value.bio || "",
+//     });
+//   } catch (err) {
+//     res.status(500).send({ message: err.message });
+//   }
+// });
+// UPDATE current user
+app.put("/auth/me", verifyJWT, async (req, res) => {
+  try {
+    if (!req.user?.email)
+      return res.status(401).send({ message: "Unauthorized" });
+
+    const { name, photoURL, bio } = req.body;
+    const userEmail = req.user.email.toLowerCase();
+
+    const userInDb = await usersCollection.findOne({ email: userEmail });
+    if (!userInDb) return res.status(404).send({ message: "User not found" });
+
+    const updateFields = {};
+    if (name !== undefined) updateFields.name = name;
+    if (photoURL !== undefined) updateFields.photoURL = photoURL;
+    if (bio !== undefined) updateFields.bio = bio;
+
+    const result = await usersCollection.findOneAndUpdate(
+      { email: userEmail },
+      { $set: updateFields },
+      { returnDocument: "after" }
+    );
+
+    res.send({
+      email: result.email,
+      name: result.name,
+      role: result.role,
+      photoURL: result.photoURL || null,
+      bio: result.bio || "",
+    });
+  } catch (err) {
+    console.error("Profile update failed:", err);
+    res.status(500).send({ message: err.message });
+  }
+});
+
 
 /* ================= CONTEST ROUTES ================= */
 
@@ -240,7 +324,7 @@ app.post("/contests", verifyJWT, verifyCreator, async (req, res) => {
       participants: [],
       submissions: [],
       createdAt: new Date(),
-      endDate: req.body.endDate || new Date(new Date().getTime() + 3*24*60*60*1000),
+      endDate: req.body.endDate || new Date(new Date().getTime() + 3 * 24 * 60 * 60 * 1000),
     };
 
     const result = await contestsCollection.insertOne(contest);
@@ -315,7 +399,7 @@ app.put("/contests/status/:id", verifyJWT, verifyAdmin, async (req, res) => {
       { returnDocument: "after" }
     );
 
-    res.send(result.value);
+    res.send(result);
   } catch (err) {
     res.status(500).send({ message: err.message });
   }
@@ -424,12 +508,13 @@ app.put("/contests/:id", verifyJWT, verifyCreator, async (req, res) => {
       "price",
       "prizeMoney",
       "taskInstruction",
-      "category ",
+      "category",
       "endDate",
       "isActive"
     ];
 
     const updateFields = {};
+
     allowedFields.forEach((field) => {
       if (req.body[field] !== undefined) updateFields[field] = req.body[field];
     });
@@ -440,7 +525,7 @@ app.put("/contests/:id", verifyJWT, verifyCreator, async (req, res) => {
       { returnDocument: "after" }
     );
 
-    res.send({ message: "Contest updated successfully", contest: result.value });
+    res.send({ message: "Contest updated successfully", contest: result });
   } catch (err) {
     res.status(500).send({ message: err.message });
   }
@@ -513,6 +598,26 @@ app.get("/leaderboard", async (req, res) => {
 
 
 
+
+// ================= PAYMENT =================
+app.post("/create-payment-intent", verifyJWT, async (req, res) => {
+  try {
+    const { price } = req.body;
+    const amount = parseInt(price * 100); // Convert to cents
+
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: amount,
+      currency: "usd",
+      payment_method_types: ["card"],
+    });
+
+    res.send({
+      clientSecret: paymentIntent.client_secret,
+    });
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+});
 
 /* ================= SERVER ================= */
 app.get("/", (req, res) => res.send("🚀 ContestHub API Running"));
