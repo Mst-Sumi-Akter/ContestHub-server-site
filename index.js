@@ -197,7 +197,7 @@ app.put("/users/:id/role", verifyJWT, verifyAdmin, async (req, res) => {
 
     // Prevent changing own role (optional safety)
     if (req.user.email === (await usersCollection.findOne({ _id: new ObjectId(id) }))?.email && role !== "admin") {
-      // allow self-demotion? usually dangerous. Let's warn or allow.
+      
       // Implementation choice: Allow.
     }
 
