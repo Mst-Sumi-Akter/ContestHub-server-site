@@ -4,21 +4,45 @@ const cors = require("cors");
 const { MongoClient, ObjectId } = require("mongodb");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
-// STRIPE KEY - Use environment variable
+const admin = require("firebase-admin");
+
+// --- Safer Firebase Initialization ---
+try {
+  if (process.env.FIREBASE_SERVICE_KEY_BASE64) {
+    const serviceAccount = JSON.parse(
+      Buffer.from(process.env.FIREBASE_SERVICE_KEY_BASE64, "base64").toString("utf8")
+    );
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+    console.log(" Firebase Admin initialized");
+  } else if (process.env.FIREBASE_SERVICE_ACCOUNT_PATH) {
+    const serviceAccount = require(process.env.FIREBASE_SERVICE_ACCOUNT_PATH);
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+    console.log("Firebase Admin initialized via path");
+  } else {
+    console.warn(" FIREBASE_SERVICE_KEY_BASE64 missing. Google Auth might fail.");
+  }
+} catch (error) {
+  console.error(" Firebase Admin failed to initialize:", error.message);
+}
+
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
 if (!STRIPE_SECRET_KEY) {
-  console.warn(" STRIPE_SECRET_KEY missing in .env. Payment features will be disabled.");
+  console.warn("STRIPE_SECRET_KEY missing. Payment features disabled.");
 }
 const stripe = STRIPE_SECRET_KEY ? require("stripe")(STRIPE_SECRET_KEY) : null;
 
 const app = express();
 
 /* ================= MIDDLEWARE ================= */
-app.use(cors({ origin: ["http://localhost:5173", "http://localhost:5174"], credentials: true }));
+app.use(cors({ origin: ["http://localhost:5173", "http://localhost:5174", "https://contest-hub-b7db7.web.app", "https://contest-hub-b7db7.firebaseapp.com", "https://contest-hub-server-gamma-drab.vercel.app", "https://fantastic-cucurucho-3fa98b.netlify.app"], credentials: true }));
 app.use(express.json());
 
 if (!process.env.JWT_SECRET) {
-  console.error("JWT_SECRET missing in .env");
+  console.error(" JWT_SECRET missing in .env");
   process.exit(1);
 }
 
@@ -27,14 +51,38 @@ const client = new MongoClient(process.env.MONGO_URI);
 let usersCollection;
 let contestsCollection;
 
-async function connectDB() {
-  await client.connect();
-  const db = client.db(process.env.DB_NAME || "contestHub");
-  usersCollection = db.collection("users");
-  contestsCollection = db.collection("contests");
-  console.log("MongoDB Connected");
+// Ensure DB connection before handling requests
+async function ensureDB(req, res, next) {
+  if (!usersCollection || !contestsCollection) {
+    try {
+      await connectDB();
+      next();
+    } catch (err) {
+      res.status(500).send({ message: "Database connection failed" });
+    }
+  } else {
+    next();
+  }
 }
-connectDB();
+
+async function connectDB() {
+  if (usersCollection && contestsCollection) return;
+  try {
+    await client.connect();
+    const db = client.db(process.env.DB_NAME || "contestHub");
+    usersCollection = db.collection("users");
+    contestsCollection = db.collection("contests");
+    console.log("MongoDB Connected");
+  } catch (error) {
+    console.error(" MongoDB Connection Error:", error.message);
+    throw error;
+  }
+}
+
+// Pre-connect for local environment
+if (process.env.NODE_ENV !== "production") {
+  connectDB().catch(console.error);
+}
 
 /* ================= JWT ================= */
 const createToken = (user) =>
@@ -70,7 +118,7 @@ const verifyCreator = (req, res, next) => {
 /* ================= AUTH ROUTES ================= */
 
 // REGISTER
-app.post("/auth/register", async (req, res) => {
+app.post("/auth/register", ensureDB, async (req, res) => {
   try {
     const { name, email, password, role } = req.body;
     if (!email || !password)
@@ -88,6 +136,7 @@ app.post("/auth/register", async (req, res) => {
       email: email.toLowerCase(),
       password: hashedPassword,
       role: role || "user",
+      contestLimit: 2, // Default limit for free starters
       createdAt: new Date(),
     };
 
@@ -101,15 +150,17 @@ app.post("/auth/register", async (req, res) => {
 });
 
 // LOGIN
-app.post("/auth/login", async (req, res) => {
+app.post("/auth/login", ensureDB, async (req, res) => {
   try {
     const { email, password } = req.body;
+    if (!email || !password) return res.status(400).send({ message: "Email and password required" });
+
     const user = await usersCollection.findOne({
       email: email.toLowerCase(),
     });
 
     if (!user) return res.status(404).send({ message: "User not found" });
-    if (!bcrypt.compareSync(password, user.password))
+    if (!user.password || !bcrypt.compareSync(password, user.password))
       return res.status(400).send({ message: "Invalid credentials" });
 
     const token = createToken(user);
@@ -125,7 +176,7 @@ app.post("/auth/login", async (req, res) => {
 });
 
 // GOOGLE LOGIN
-app.post("/auth/google-login", async (req, res) => {
+app.post("/auth/google-login", ensureDB, async (req, res) => {
   try {
     const { email, name, photoURL } = req.body;
     if (!email || !name)
@@ -142,6 +193,10 @@ app.post("/auth/google-login", async (req, res) => {
         createdAt: new Date(),
       };
       await usersCollection.insertOne(user);
+    } else if (photoURL && !user.photoURL) {
+      // Update photo if missing
+      await usersCollection.updateOne({ _id: user._id }, { $set: { photoURL } });
+      user.photoURL = photoURL;
     }
 
     const token = createToken(user);
@@ -154,12 +209,13 @@ app.post("/auth/google-login", async (req, res) => {
       bio: user.bio || "",
     });
   } catch (err) {
+    console.error("Google login error:", err);
     res.status(500).send({ message: err.message });
   }
 });
 
 // GET current user
-app.get("/auth/me", verifyJWT, async (req, res) => {
+app.get("/auth/me", ensureDB, verifyJWT, async (req, res) => {
   try {
     const user = await usersCollection.findOne({ email: req.user.email });
     if (!user) return res.status(404).send({ message: "User not found" });
@@ -177,7 +233,7 @@ app.get("/auth/me", verifyJWT, async (req, res) => {
 });
 
 // GET all users (Admin only)
-app.get("/users", verifyJWT, verifyAdmin, async (req, res) => {
+app.get("/users", ensureDB, verifyJWT, verifyAdmin, async (req, res) => {
   try {
     const users = await usersCollection.find({}).toArray();
     res.send(users);
@@ -187,19 +243,13 @@ app.get("/users", verifyJWT, verifyAdmin, async (req, res) => {
 });
 
 // UPDATE user role (Admin only)
-app.put("/users/:id/role", verifyJWT, verifyAdmin, async (req, res) => {
+app.put("/users/:id/role", ensureDB, verifyJWT, verifyAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { role } = req.body;
 
     if (!ObjectId.isValid(id))
       return res.status(400).send({ message: "Invalid user ID" });
-
-    // Prevent changing own role (optional safety)
-    if (req.user.email === (await usersCollection.findOne({ _id: new ObjectId(id) }))?.email && role !== "admin") {
-      
-      // Implementation choice: Allow.
-    }
 
     await usersCollection.updateOne(
       { _id: new ObjectId(id) },
@@ -212,17 +262,13 @@ app.put("/users/:id/role", verifyJWT, verifyAdmin, async (req, res) => {
 });
 
 // UPDATE current user
-
-app.put("/auth/me", verifyJWT, async (req, res) => {
+app.put("/auth/me", ensureDB, verifyJWT, async (req, res) => {
   try {
     if (!req.user?.email)
       return res.status(401).send({ message: "Unauthorized" });
 
     const { name, photoURL, bio } = req.body;
     const userEmail = req.user.email.toLowerCase();
-
-    const userInDb = await usersCollection.findOne({ email: userEmail });
-    if (!userInDb) return res.status(404).send({ message: "User not found" });
 
     const updateFields = {};
     if (name !== undefined) updateFields.name = name;
@@ -234,6 +280,8 @@ app.put("/auth/me", verifyJWT, async (req, res) => {
       { $set: updateFields },
       { returnDocument: "after" }
     );
+
+    if (!result) return res.status(404).send({ message: "User not found" });
 
     res.send({
       email: result.email,
@@ -251,12 +299,29 @@ app.put("/auth/me", verifyJWT, async (req, res) => {
 
 /* ================= CONTEST ROUTES ================= */
 
-// GET all contests OR creator-wise
-app.get("/contests", async (req, res) => {
+// GET all contests OR creator-wise OR search
+app.get("/contests", ensureDB, async (req, res) => {
   try {
-    const { creatorEmail } = req.query;
-    const filter = creatorEmail ? { creatorEmail } : {};
-    const contests = await contestsCollection.find(filter).toArray();
+    const { creatorEmail, category, search } = req.query;
+    let query = {};
+
+    if (creatorEmail) {
+      query.creatorEmail = creatorEmail;
+    }
+
+    if (category && category !== "All") {
+      query.category = category;
+    }
+
+    if (search) {
+      query.$or = [
+        { title: { $regex: search, $options: "i" } },
+        { category: { $regex: search, $options: "i" } },
+        { description: { $regex: search, $options: "i" } },
+      ];
+    }
+
+    const contests = await contestsCollection.find(query).toArray();
     res.send(contests);
   } catch (err) {
     res.status(500).send({ message: err.message });
@@ -264,7 +329,7 @@ app.get("/contests", async (req, res) => {
 });
 
 // GET contest by ID
-app.get("/contests/:id", verifyJWT, async (req, res) => {
+app.get("/contests/:id", ensureDB, verifyJWT, async (req, res) => {
   try {
     const { id } = req.params;
     if (!ObjectId.isValid(id))
@@ -279,9 +344,17 @@ app.get("/contests/:id", verifyJWT, async (req, res) => {
   }
 });
 
-// CREATE contest (creator only)
-app.post("/contests", verifyJWT, verifyCreator, async (req, res) => {
+app.post("/contests", ensureDB, verifyJWT, verifyCreator, async (req, res) => {
   try {
+    // Check limit
+    const user = await usersCollection.findOne({ email: req.user.email });
+    const count = await contestsCollection.countDocuments({ creatorEmail: req.user.email });
+    const limit = user.contestLimit || 2;
+
+    if (count >= limit) {
+      return res.status(403).send({ message: `Contest limit reached (${limit}). Please upgrade your package.` });
+    }
+
     const contest = {
       ...req.body,
       creatorEmail: req.user.email,
@@ -300,7 +373,7 @@ app.post("/contests", verifyJWT, verifyCreator, async (req, res) => {
 });
 
 // EDIT contest (creator & pending only)
-app.put("/contests/edit/:id", verifyJWT, verifyCreator, async (req, res) => {
+app.put("/contests/edit/:id", ensureDB, verifyJWT, verifyCreator, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -318,7 +391,7 @@ app.put("/contests/edit/:id", verifyJWT, verifyCreator, async (req, res) => {
 });
 
 // DELETE contest - Creator (pending) or Admin
-app.delete("/contests/:id", verifyJWT, async (req, res) => {
+app.delete("/contests/:id", ensureDB, verifyJWT, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -350,7 +423,7 @@ app.delete("/contests/:id", verifyJWT, async (req, res) => {
 
 
 // ADMIN confirm / reject contest
-app.put("/contests/status/:id", verifyJWT, verifyAdmin, async (req, res) => {
+app.put("/contests/status/:id", ensureDB, verifyJWT, verifyAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
@@ -371,7 +444,7 @@ app.put("/contests/status/:id", verifyJWT, verifyAdmin, async (req, res) => {
 });
 
 // REGISTER FOR CONTEST
-app.post("/contests/:id/register", verifyJWT, async (req, res) => {
+app.post("/contests/:id/register", ensureDB, verifyJWT, async (req, res) => {
   try {
     const { id } = req.params;
     const userEmail = req.user.email;
@@ -395,7 +468,7 @@ app.post("/contests/:id/register", verifyJWT, async (req, res) => {
 });
 
 // SUBMIT TASK
-app.post("/contests/:id/submit-task", verifyJWT, async (req, res) => {
+app.post("/contests/:id/submit-task", ensureDB, verifyJWT, async (req, res) => {
   try {
     const { id } = req.params;
     const { submission } = req.body;
@@ -422,7 +495,7 @@ app.post("/contests/:id/submit-task", verifyJWT, async (req, res) => {
 });
 
 // Declare winner for a contest (creator only)
-app.put("/contests/:id/declare-winner", verifyJWT, verifyCreator, async (req, res) => {
+app.put("/contests/:id/declare-winner", ensureDB, verifyJWT, verifyCreator, async (req, res) => {
   try {
     const { id } = req.params;
     const { userEmail } = req.body;
@@ -432,12 +505,11 @@ app.put("/contests/:id/declare-winner", verifyJWT, verifyCreator, async (req, re
     const contest = await contestsCollection.findOne({ _id: new ObjectId(id) });
     if (!contest) return res.status(404).send({ message: "Contest not found" });
 
-    // Only allow one winner per contest
-    if (contest.submissions.some(s => s.status === "winner")) {
+    if (contest.submissions?.some(s => s.status === "winner")) {
       return res.status(400).send({ message: "Winner already declared" });
     }
 
-    const updatedSubmissions = contest.submissions.map((s) =>
+    const updatedSubmissions = (contest.submissions || []).map((s) =>
       s.userEmail === userEmail ? { ...s, status: "winner" } : s
     );
 
@@ -452,8 +524,9 @@ app.put("/contests/:id/declare-winner", verifyJWT, verifyCreator, async (req, re
     res.status(500).send({ message: "Internal server error" });
   }
 });
+
 // UPDATE contest - Creator can update own contest
-app.put("/contests/:id", verifyJWT, verifyCreator, async (req, res) => {
+app.put("/contests/:id", ensureDB, verifyJWT, verifyCreator, async (req, res) => {
   try {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) return res.status(400).send({ message: "Invalid contest ID" });
@@ -461,25 +534,16 @@ app.put("/contests/:id", verifyJWT, verifyCreator, async (req, res) => {
     const contest = await contestsCollection.findOne({ _id: new ObjectId(id) });
     if (!contest) return res.status(404).send({ message: "Contest not found" });
 
-    // Only allow creator of this contest to update
     if (contest.creatorEmail !== req.user.email) {
       return res.status(403).send({ message: "Not authorized" });
     }
 
     const allowedFields = [
-      "title",
-      "description",
-      "image",
-      "price",
-      "prizeMoney",
-      "taskInstruction",
-      "category",
-      "endDate",
-      "isActive"
+      "title", "description", "image", "price", "prizeMoney",
+      "taskInstruction", "category", "endDate", "isActive"
     ];
 
     const updateFields = {};
-
     allowedFields.forEach((field) => {
       if (req.body[field] !== undefined) updateFields[field] = req.body[field];
     });
@@ -497,7 +561,7 @@ app.put("/contests/:id", verifyJWT, verifyCreator, async (req, res) => {
 });
 
 // GET submissions for a contest (creator only)
-app.get("/contests/:id/submissions", verifyJWT, verifyCreator, async (req, res) => {
+app.get("/contests/:id/submissions", ensureDB, verifyJWT, verifyCreator, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -507,17 +571,16 @@ app.get("/contests/:id/submissions", verifyJWT, verifyCreator, async (req, res) 
     const contest = await contestsCollection.findOne({ _id: new ObjectId(id) });
     if (!contest) return res.status(404).send({ message: "Contest not found" });
 
-    // Only the contest creator can view submissions
     if (contest.creatorEmail !== req.user.email)
       return res.status(403).send({ message: "Not authorized" });
 
-    // Send submissions with participant info
     res.send(
       (contest.submissions || []).map((s) => ({
         participantName: s.participantName || "Anonymous",
         participantEmail: s.userEmail,
         taskInfo: s.submission,
         submittedAt: s.submittedAt,
+        status: s.status,
       }))
     );
   } catch (err) {
@@ -526,71 +589,103 @@ app.get("/contests/:id/submissions", verifyJWT, verifyCreator, async (req, res) 
   }
 });
 
-// ================= LEADERBOARD =================
-app.get("/leaderboard", async (req, res) => {
-  try {
-    const users = await usersCollection.find({}).toArray();
-    const contests = await contestsCollection.find({}).toArray();
+// ================= PACKAGES & LIMITS =================
 
-    // Calculate wins per user
-    const leaderboard = users.map((user) => {
-      let points = 0;
+const defaultPackages = [
+  { id: "starter", name: "Starter", price: 0, limit: 2, description: "Post up to 2 contests for free" },
+  { id: "pro", name: "Pro", price: 10, limit: 10, description: "Post up to 10 contests" },
+  { id: "ultimate", name: "Ultimate", price: 25, limit: 100, description: "Unlimited-ish (up to 100) contests" },
+];
 
-      contests.forEach((contest) => {
-        if (contest.submissions?.some((s) => s.userEmail === user.email && s.status === "winner")) {
-          points += 1; // 1 point per contest win
-        }
-      });
-
-      return {
-        id: user._id,
-        name: user.name,
-        role: user.role,
-        points,
-      };
-    });
-
-    // Sort descending by points
-    leaderboard.sort((a, b) => b.points - a.points);
-
-    res.send(leaderboard);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Internal server error" });
-  }
+app.get("/packages", async (req, res) => {
+  res.send(defaultPackages);
 });
 
-
-
-
-
-// ================= PAYMENT =================
-app.post("/create-payment-intent", verifyJWT, async (req, res) => {
+// BUY PACKAGE
+app.post("/users/buy-package", ensureDB, verifyJWT, async (req, res) => {
   try {
-    if (!stripe) {
-      return res.status(500).send({ message: "Stripe is not configured on the server. Please add STRIPE_SECRET_KEY to your .env file." });
-    }
-    const { price } = req.body;
-    if (!price || isNaN(price)) {
-      return res.status(400).send({ message: "Invalid price" });
-    }
-    const amount = Math.round(parseFloat(price) * 100); 
+    const { packageId } = req.body;
+    const pkg = defaultPackages.find((p) => p.id === packageId);
+    if (!pkg) return res.status(400).send({ message: "Invalid package" });
 
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: amount,
-      currency: "usd",
-      payment_method_types: ["card"],
-    });
+    // Update user limit
+    await usersCollection.updateOne(
+      { email: req.user.email },
+      { $set: { contestLimit: pkg.limit, currentPackage: pkg.id } }
+    );
 
-    res.send({
-      clientSecret: paymentIntent.client_secret,
-    });
+    res.send({ message: "Package purchased successfully", limit: pkg.limit });
   } catch (err) {
     res.status(500).send({ message: err.message });
   }
 });
 
+// ================= LEADERBOARD =================
+app.get("/leaderboard", ensureDB, async (req, res) => {
+  try {
+    // Optimized Leaderboard Calculation using MongoDB Aggregation
+    const leaderboard = await contestsCollection.aggregate([
+      { $unwind: "$submissions" },
+      { $match: { "submissions.status": "winner" } },
+      { $group: { _id: "$submissions.userEmail", points: { $sum: 1 } } },
+      { $sort: { points: -1 } },
+      {
+        $lookup: {
+          from: "users",
+          localField: "_id",
+          foreignField: "email",
+          as: "userDetails"
+        }
+      },
+      { $unwind: "$userDetails" },
+      {
+        $project: {
+          _id: 0,
+          email: "$_id",
+          name: "$userDetails.name",
+          photoURL: "$userDetails.photoURL",
+          role: "$userDetails.role",
+          points: 1
+        }
+      }
+    ]).toArray();
+
+    res.send(leaderboard);
+  } catch (err) {
+    console.error("Leaderboard error:", err);
+    res.status(500).send({ message: "Internal server error" });
+  }
+});
+
+
+// ================= PAYMENT =================
+app.post("/create-payment-intent", ensureDB, verifyJWT, async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(500).send({ message: "Stripe not configured" });
+    }
+
+    let { price } = req.body;
+
+    price = Number(price);
+    if (!price || price <= 0) {
+      return res.status(400).send({ message: "Invalid price" });
+    }
+
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: Math.round(price * 100),
+      currency: "usd",
+      automatic_payment_methods: { enabled: true },
+    });
+
+    res.send({ clientSecret: paymentIntent.client_secret });
+  } catch (err) {
+    console.error("Stripe Error:", err);
+    res.status(500).send({ message: "Payment failed" });
+  }
+});
+
 /* ================= SERVER ================= */
-app.get("/", (req, res) => res.send(" ContestHub API Running"));
+app.get("/", (req, res) => res.send(" ContestHub API Running (Modernized)"));
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(` Server running on http://localhost:${PORT}`));
